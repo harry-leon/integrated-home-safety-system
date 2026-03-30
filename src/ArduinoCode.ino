@@ -1,5 +1,3 @@
-// =============================================
-// =============================================
 
 #define BLYNK_TEMPLATE_ID   "TMPL6p8KU2UbZ"
 #define BLYNK_TEMPLATE_NAME "Project IOT102"
@@ -84,7 +82,7 @@ Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 // CREDENTIALS
 // =========================================================
 char auth[] = BLYNK_AUTH_TOKEN;
-char ssid[] = "Bs11-1207";
+char ssid[] = "Bs11-12077";
 char pass[] = "12071207";
 
 // =========================================================
@@ -100,7 +98,10 @@ byte checkChar[8]  = {0b00000,0b00001,0b00011,0b10110,0b11100,0b01000,0b00000,0b
 // =========================================================
 enum SystemState {
   STATE_NORMAL, STATE_ENTER_PASS, STATE_CHANGE_PASS,
-  STATE_ALERT_GAS, STATE_ALERT_PIR, STATE_ALERT_PASS
+  STATE_ALERT_GAS, STATE_ALERT_PASS,
+  STATE_ENROLL_AUTH, STATE_ENROLL_ID,
+  STATE_ALERT_PIR,
+  STATE_KEY_D_AUTH
 };
 SystemState sysState = STATE_NORMAL;
 
@@ -110,10 +111,12 @@ ChangePStep cpStep = CP_OLD;
 // =========================================================
 // GLOBAL VARIABLES
 // =========================================================
-String password   = "5678";
-String inputPass  = "";
-String newPassBuf = "";
+String password       = "5678";
+String inputPass      = "";
+String newPassBuf     = "";
 String matrixLastText = "";
+String pendingName    = "";
+String enrollIDStr    = "";
 
 int  passFailCount   = 0;
 int  fingerFailCount = 0;
@@ -129,6 +132,7 @@ bool isDeleting      = false;
 bool fingerPresent   = false;
 bool fingerProcessed = false;
 bool blinkState      = false;
+bool enrollingNow    = false;
 
 unsigned long alertStartTime  = 0;
 unsigned long lcdUpdateTime   = 0;
@@ -136,14 +140,40 @@ unsigned long lastKeyTime     = 0;
 unsigned long lastBlink       = 0;
 unsigned long lastConsoleTime = 0;
 
-// display mode 0 — dùng global thay vì static local
 int  dispLastSec = -1;
 unsigned long dispT0 = 0;
 
 // =========================================================
+// AUTO-LOCK
+// =========================================================
+unsigned long autoLockDelay   = 7000;
+unsigned long doorOpenedAt    = 0;
+bool          autoLockEnabled = true;
+
+// =========================================================
+// PIR ALERT & KEYPAD LOCKOUT
+// =========================================================
+bool pirAlertEnabled        = false;
+bool pirAlertActive         = false;
+unsigned long pirAlertStart = 0;
+
+int  keypadFailCount                     = 0;
+const int KEYPAD_MAX_FAIL                = 5;
+const unsigned long KEYPAD_LOCK_DURATION = 30000;
+bool keypadLocked                        = false;
+unsigned long keypadLockedAt             = 0;
+
+// =========================================================
+// ĐÈN TỰ ĐỘNG (PIR + tối)
+// =========================================================
+bool          lightOn              = false;
+unsigned long lightOnAt            = 0;
+const unsigned long LIGHT_DURATION = 10000;
+
+// =========================================================
 // NON-BLOCKING LED
 // =========================================================
-unsigned long ledTimer   = 0;
+unsigned long ledTimer    = 0;
 int           ledDuration = 0;
 int           ledType     = 0;
 
@@ -168,6 +198,7 @@ bool beepOn = false;
 unsigned long beepTimer = 0;
 
 void beepStart(int* seq, int len) {
+  if (enrollingNow) return;
   memcpy(beepSeq, seq, len * sizeof(int));
   beepLen = len; beepIdx = 0; beepOn = true;
   beepTimer = millis(); digitalWrite(BUZZER_PIN, HIGH);
@@ -185,13 +216,14 @@ void updateBuzzer() {
   }
 }
 
-void beepKey()  { int s[] = {80, 0};              beepStart(s, 1); }
-void beepOK()   { int s[] = {100, 80, 100, 0};    beepStart(s, 4); }
-void beepFail() { int s[] = {600, 0};              beepStart(s, 1); }
-void beepWarn() { int s[] = {80,60,80,60,80, 0};   beepStart(s, 6); }
+void beepKey()    { int s[] = {80, 0};           beepStart(s, 1); }
+void beepOK()     { int s[] = {100, 80, 100, 0}; beepStart(s, 4); }
+void beepFail()   { int s[] = {600, 0};           beepStart(s, 1); }
+void beepWarn()   { int s[] = {80,60,80,60,80,0}; beepStart(s, 6); }
+void beepDelete() { int s[] = {150, 100, 150, 0}; beepStart(s, 4); }
 
 // =========================================================
-// MATRIX — PA_PRINT tĩnh
+// MATRIX
 // =========================================================
 void matrixShow(const char* txt) {
   if (matrixLastText == String(txt)) return;
@@ -204,24 +236,31 @@ void matrixSetNormal() { matrixShow("Normal"); }
 void matrixSetAlert()  { matrixShow("ALERT!!"); }
 
 // =========================================================
-// HELPER: flush Blynk sau khi thoát blocking
+// HELPERS
 // =========================================================
 void blynkFlush(int cycles = 10, int delayMs = 50) {
-  for (int i = 0; i < cycles; i++) {
-    Blynk.run();
-    timer.run();
-    delay(delayMs);
-  }
+  for (int i = 0; i < cycles; i++) { Blynk.run(); timer.run(); delay(delayMs); }
+}
+void blockingTick() {
+  Blynk.run(); timer.run(); timeClient.update(); delay(20);
 }
 
 // =========================================================
-// HELPER: tick dùng trong các vòng while blocking
+// LƯU / ĐỌC / XÓA TÊN VÂN TAY
 // =========================================================
-void blockingTick() {
-  Blynk.run();
-  timer.run();
-  timeClient.update();
-  delay(20);
+void saveFingerName(int id, const String& name) {
+  String key = "fn_" + String(id);
+  prefs.putString(key.c_str(), name);
+  Serial.printf("[NAME] Saved: ID%d = %s\n", id, name.c_str());
+}
+String loadFingerName(int id) {
+  String key = "fn_" + String(id);
+  return prefs.getString(key.c_str(), "ID:" + String(id));
+}
+void deleteFingerName(int id) {
+  String key = "fn_" + String(id);
+  prefs.remove(key.c_str());
+  Serial.printf("[NAME] Deleted name for ID%d\n", id);
 }
 
 // =========================================================
@@ -231,23 +270,20 @@ void getWeatherData() {
   if (WiFi.status() != WL_CONNECTED) return;
   HTTPClient http;
   http.begin(weatherURL);
-  http.setTimeout(5000);  // tránh treo nếu server chậm
+  http.setTimeout(5000);
   if (http.GET() != 200) { http.end(); return; }
-  StaticJsonDocument<2048> doc;
+  JsonDocument doc;
   if (deserializeJson(doc, http.getString())) { http.end(); return; }
-
-  weatherTemp    = doc["main"]["temp"].as<float>();
-  String main    = doc["weather"][0]["main"].as<String>();
-  int    clouds  = doc["clouds"]["all"].as<int>();
-
+  weatherTemp = doc["main"]["temp"].as<float>();
+  String main = doc["weather"][0]["main"].as<String>();
+  int clouds  = doc["clouds"]["all"].as<int>();
   if      (main == "Clear")                                     weatherDesc = "SUNNY";
   else if (main == "Clouds" && clouds <= 50)                    weatherDesc = "PARTLY CLOUDY";
-  else if (main == "Clouds" && clouds > 50)                     weatherDesc = "CLOUDY";
+  else if (main == "Clouds" && clouds >  50)                    weatherDesc = "CLOUDY";
   else if (main == "Rain"   || main == "Drizzle")               weatherDesc = "RAINY";
   else if (main == "Thunderstorm")                              weatherDesc = "STORM";
   else if (main == "Mist"   || main == "Haze" || main == "Fog") weatherDesc = "FOGGY";
   else                                                          weatherDesc = main;
-
   Blynk.virtualWrite(V50, weatherTemp);
   Blynk.virtualWrite(V51, weatherDesc);
   Serial.printf("[WEATHER] %.1f C  %s\n", weatherTemp, weatherDesc.c_str());
@@ -264,30 +300,54 @@ void sendSensorData() {
 }
 
 // =========================================================
+// FORWARD DECLARATIONS
+// =========================================================
+void closeDoor(bool byAutoLock);
+void openDoor();
+void restoreNormalLCD();
+
+// =========================================================
 // BLYNK VIRTUAL WRITES
 // =========================================================
 BLYNK_WRITE(V100) {
   idFromBlynk = param.asInt();
-  Blynk.virtualWrite(V103, String("Selected ID: ") + idFromBlynk);
+  String existingName = loadFingerName(idFromBlynk);
+  String info = "ID:" + String(idFromBlynk);
+  if (!existingName.startsWith("ID:")) info += " | " + existingName;
+  Blynk.virtualWrite(V103, info);
+}
+BLYNK_WRITE(V104) {
+  pendingName = param.asStr();
+  pendingName.trim();
+  Serial.printf("[NAME] Pending: '%s'\n", pendingName.c_str());
+  Blynk.virtualWrite(V103, "Name ready: " + pendingName);
 }
 BLYNK_WRITE(V101) {
-  // Chỉ nhận tín hiệu HIGH, và chỉ khi hệ thống đang rảnh
-  // Guard isEnrolling/isDeleting ngăn Blynk reconnect trigger lại
   if (param.asInt() == 1 && !isEnrolling && !isDeleting && sysState == STATE_NORMAL) {
+    if (pendingName.length() == 0) {
+      Blynk.virtualWrite(V103, "ERROR: Enter name first! (V104)");
+      Blynk.virtualWrite(V101, 0);
+      lcd.clear();
+      lcd.setCursor(0,0); lcd.print(" Enter name 1st ");
+      lcd.setCursor(0,1); lcd.print("  in Blynk V104 ");
+      lcdUpdateTime = millis() + 2500;
+      beepFail(); ledRed(800);
+      return;
+    }
     isEnrolling = true; normalState = false;
-    Blynk.virtualWrite(V103, "ENROLLING...");
-    Blynk.virtualWrite(V101, 0);  // reset button ngay để tránh trigger lại khi reconnect
+    Blynk.virtualWrite(V103, "ENROLLING: " + pendingName);
+    Blynk.virtualWrite(V101, 0);
     lcd.clear();
     lcd.setCursor(0,0); lcd.print("  Enrolling...  ");
-    lcd.setCursor(0,1); lcd.print("ID:             ");
-    lcd.setCursor(4,1); lcd.print(idFromBlynk);
+    String showName = pendingName.length() > 16 ? pendingName.substring(0, 16) : pendingName;
+    lcd.setCursor(0,1); lcd.print(showName);
   }
 }
 BLYNK_WRITE(V102) {
   if (param.asInt() == 1 && !isEnrolling && !isDeleting && sysState == STATE_NORMAL) {
     isDeleting = true; normalState = false;
     Blynk.virtualWrite(V103, "DELETING...");
-    Blynk.virtualWrite(V102, 0);  // reset button ngay
+    Blynk.virtualWrite(V102, 0);
     lcd.clear();
     lcd.setCursor(0,0); lcd.print("  Deleting...   ");
     lcd.setCursor(0,1); lcd.print("ID:             ");
@@ -295,18 +355,8 @@ BLYNK_WRITE(V102) {
   }
 }
 BLYNK_WRITE(V20) {
-  if (param.asInt() == 1) {
-    openDoor();
-  } else {
-    isDoorOpen = false; myServo.write(0);
-    matrixLastText = ""; matrixSetNormal();
-    lcd.clear();
-    lcd.setCursor(0,0); lcd.print("  Smart  Lock   ");
-    lcd.setCursor(0,1); lcd.print("  Door: CLOSED  ");
-    lcdUpdateTime = millis() + 2000;
-    Blynk.virtualWrite(V30, "Closed");
-    Serial.println("[BLYNK] Door closed");
-  }
+  if (param.asInt() == 1) openDoor();
+  else                    closeDoor(false);
 }
 BLYNK_WRITE(V40) {
   alertEnabled = param.asInt();
@@ -316,9 +366,28 @@ BLYNK_WRITE(V40) {
   lcd.setCursor(0,1); lcd.print(alertEnabled ? "    ENABLED     " : "    DISABLED    ");
   lcdUpdateTime = millis() + 2000;
 }
+BLYNK_WRITE(V70) {
+  int s = constrain(param.asInt(), 5, 300);
+  autoLockDelay = (unsigned long)s * 1000;
+  lcd.clear();
+  lcd.setCursor(0,0); lcd.print("  Auto-lock:    ");
+  char buf[17]; sprintf(buf, "  After %3ds     ", s);
+  lcd.setCursor(0,1); lcd.print(buf);
+  lcdUpdateTime = millis() + 2000;
+  Serial.printf("[AUTO-LOCK] Delay = %ds\n", s);
+}
+BLYNK_WRITE(V71) {
+  autoLockEnabled = param.asInt();
+  if (!autoLockEnabled) doorOpenedAt = 0;
+  lcd.clear();
+  lcd.setCursor(0,0); lcd.print("  Auto-lock:    ");
+  lcd.setCursor(0,1); lcd.print(autoLockEnabled ? "    ENABLED     " : "    DISABLED    ");
+  lcdUpdateTime = millis() + 2000;
+  Serial.printf("[AUTO-LOCK] %s\n", autoLockEnabled ? "ON" : "OFF");
+}
 
 // =========================================================
-// RESTORE LCD sau enroll/delete — dùng chung
+// RESTORE LCD
 // =========================================================
 void restoreNormalLCD() {
   lcd.clear();
@@ -328,78 +397,78 @@ void restoreNormalLCD() {
 }
 
 // =========================================================
-// CHECK VÂN TAY TRÙNG — quét nhanh trước khi enroll
-// Trả về ID nếu đã tồn tại, -1 nếu chưa có
+// ĐÓNG CỬA
+// =========================================================
+void closeDoor(bool byAutoLock) {
+  if (!isDoorOpen) return;
+  isDoorOpen = false; doorOpenedAt = 0;
+  myServo.write(0);
+  matrixLastText = ""; matrixSetNormal();
+  lcd.clear();
+  lcd.setCursor(0,0); lcd.print("  Smart  Lock   ");
+  lcd.setCursor(0,1); lcd.print(byAutoLock ? "  Auto  LOCKED  " : "  Door: CLOSED  ");
+  lcdUpdateTime = millis() + 2000;
+  Blynk.virtualWrite(V30, "Closed");
+  if (byAutoLock) {
+    beepWarn();
+    Serial.printf("[AUTO-LOCK] Locked after %lus\n", autoLockDelay / 1000);
+  } else {
+    Serial.println("[DOOR] Closed manually");
+  }
+}
+
+// =========================================================
+// CHECK VÂN TAY TRÙNG
 // =========================================================
 int checkDuplicateFingerprint() {
   lcd.clear();
   lcd.setCursor(0,0); lcd.print("Checking dup... ");
   lcd.setCursor(0,1); lcd.print("Place finger... ");
   Blynk.virtualWrite(V103, "Checking duplicate...");
-
   unsigned long t = millis();
   int p = -1;
   while (p != FINGERPRINT_OK) {
-    if (millis() - t > ENROLL_TIMEOUT) return -2;  // timeout
+    if (millis() - t > ENROLL_TIMEOUT) return -2;
     p = finger.getImage();
     blockingTick();
   }
   if (finger.image2Tz(1) != FINGERPRINT_OK) return -1;
-  if (finger.fingerFastSearch() == FINGERPRINT_OK) {
-    return finger.fingerID;  // trùng với ID này
-  }
-  return -1;  // chưa có → ok để enroll
+  if (finger.fingerFastSearch() == FINGERPRINT_OK) return finger.fingerID;
+  return -1;
 }
 
 // =========================================================
-// ENROLL — có check trùng, restore LCD ở mọi exit path
+// ENROLL
 // =========================================================
 bool enrollFingerprint(int id) {
   int p = -1;
   unsigned long t;
-
-  // --- Kiểm tra vân tay đã tồn tại chưa ---
   int dupID = checkDuplicateFingerprint();
   if (dupID == -2) {
-    // timeout khi check dup
     lcd.clear(); lcd.setCursor(0,0); lcd.print("   Timeout!     ");
     lcd.setCursor(0,1); lcd.print("                ");
     Blynk.virtualWrite(V103, "TIMEOUT - no finger");
-    beepFail(); ledRed(1500);
-    delay(1500); restoreNormalLCD();
-    return false;
+    ledRed(1500); delay(1500); restoreNormalLCD(); return false;
   }
   if (dupID >= 0) {
-    // vân tay đã được đăng ký
-    char msg[40]; sprintf(msg, "Already enrolled! ID: %d", dupID);
-    Blynk.virtualWrite(V103, msg);
+    String dupName = loadFingerName(dupID);
+    Blynk.virtualWrite(V103, "Already enrolled! ID:" + String(dupID) + " (" + dupName + ")");
     lcd.clear(); lcd.setCursor(0,0); lcd.print(" Already exist! ");
     char buf[17]; sprintf(buf, " Already ID:%-4d", dupID);
     lcd.setCursor(0,1); lcd.print(buf);
-    beepFail(); ledRed(1500);
-    delay(2000); restoreNormalLCD();
-    return false;
+    ledRed(1500); delay(2000); restoreNormalLCD(); return false;
   }
-
-  // --- Bước 1: Đặt ngón tay lần 1 (image đã lấy trong checkDuplicate, dùng lại) ---
-  // image2Tz(1) đã chạy trong checkDuplicate → chuyển thẳng sang bước nhấc tay
   Blynk.virtualWrite(V103, "Step 1 OK - Remove finger");
   lcd.clear();
   lcd.setCursor(0,0); lcd.print("Enroll step 1/2 ");
   lcd.setCursor(0,1); lcd.print("Remove finger.. ");
-
   unsigned long rm = millis();
   while (millis() - rm < 2000) { blockingTick(); }
-
-  // Chờ nhấc tay hoàn toàn
   p = 0; t = millis();
   while (p != FINGERPRINT_NOFINGER) {
     if (millis() - t > FINGER_WAIT_TIMEOUT) break;
-    p = finger.getImage();
-    blockingTick();
+    p = finger.getImage(); blockingTick();
   }
-
-  // --- Bước 2: Đặt lại ngón tay ---
   lcd.clear();
   lcd.setCursor(0,0); lcd.print("Enroll step 2/2 ");
   lcd.setCursor(0,1); lcd.print("Place again...  ");
@@ -410,40 +479,31 @@ bool enrollFingerprint(int id) {
       lcd.clear(); lcd.setCursor(0,0); lcd.print("   Timeout!     ");
       lcd.setCursor(0,1); lcd.print("                ");
       Blynk.virtualWrite(V103, "TIMEOUT step 2");
-      beepFail(); ledRed(1000);
-      delay(1500); restoreNormalLCD();
-      return false;
+      ledRed(1000); delay(1500); restoreNormalLCD(); return false;
     }
-    p = finger.getImage();
-    blockingTick();
+    p = finger.getImage(); blockingTick();
   }
-
   if (finger.image2Tz(2) != FINGERPRINT_OK) {
     lcd.clear(); lcd.setCursor(0,0); lcd.print("  Scan  failed  ");
     lcd.setCursor(0,1); lcd.print("  Try  again... ");
     Blynk.virtualWrite(V103, "Scan failed step 2");
-    beepFail(); ledRed(1000);
-    delay(1500); restoreNormalLCD();
-    return false;
+    ledRed(1000); delay(1500); restoreNormalLCD(); return false;
   }
-
-  // --- Tạo & lưu model ---
   if (finger.createModel() == FINGERPRINT_OK && finger.storeModel(id) == FINGERPRINT_OK) {
-    Blynk.virtualWrite(V103, "SUCCESS ID: " + String(id));
-    lcd.clear(); lcd.setCursor(0,0); lcd.write(3); lcd.print(" Enroll OK!    ");
-    char buf[16]; sprintf(buf, "ID:%-13d", id);
-    lcd.setCursor(0,1); lcd.print(buf);
-    beepOK(); ledGreen(1500);
-    delay(2000); restoreNormalLCD();
-    return true;
+    String nameToSave = (pendingName.length() > 0) ? pendingName : ("ID:" + String(id));
+    saveFingerName(id, nameToSave);
+    pendingName = "";
+    Blynk.virtualWrite(V103, "SUCCESS: " + nameToSave + " (ID:" + String(id) + ")");
+    lcd.clear();
+    lcd.setCursor(0,0); lcd.write(3); lcd.print(" Enroll OK!    ");
+    String showName = nameToSave.length() > 16 ? nameToSave.substring(0, 16) : nameToSave;
+    lcd.setCursor(0,1); lcd.print(showName);
+    ledGreen(1500); delay(2500); restoreNormalLCD(); return true;
   }
-
   Blynk.virtualWrite(V103, "FAILED - store error");
   lcd.clear(); lcd.setCursor(0,0); lcd.print("  Enroll FAIL!  ");
   lcd.setCursor(0,1); lcd.print("  Try again...  ");
-  beepFail(); ledRed(1500);
-  delay(1500); restoreNormalLCD();
-  return false;
+  ledRed(1500); delay(1500); restoreNormalLCD(); return false;
 }
 
 // =========================================================
@@ -451,13 +511,15 @@ bool enrollFingerprint(int id) {
 // =========================================================
 void deleteFingerprint(int id) {
   if (finger.deleteModel(id) == FINGERPRINT_OK) {
-    Blynk.virtualWrite(V103, "DELETED ID: " + String(id));
+    String deletedName = loadFingerName(id);
+    deleteFingerName(id);
+    Blynk.virtualWrite(V103, "DELETED: " + deletedName + " (ID:" + String(id) + ")");
     lcd.clear(); lcd.setCursor(0,0); lcd.print("  Deleted OK!   ");
-    char buf[17]; sprintf(buf, "ID: %-12d", id);
-    lcd.setCursor(0,1); lcd.print(buf);
-    beepOK(); ledGreen(1000);
+    String showName = deletedName.length() > 16 ? deletedName.substring(0, 16) : deletedName;
+    lcd.setCursor(0,1); lcd.print(showName);
+    beepDelete(); ledRed(1000);
   } else {
-    Blynk.virtualWrite(V103, "ERROR: not found");
+    Blynk.virtualWrite(V103, "ERROR: ID not found");
     lcd.clear(); lcd.setCursor(0,0); lcd.print("  Delete ERROR! ");
     lcd.setCursor(0,1); lcd.print("  ID not found  ");
     beepFail(); ledRed(800);
@@ -472,6 +534,8 @@ void deleteFingerprint(int id) {
 // =========================================================
 void openDoor() {
   isDoorOpen = true; myServo.write(90); beepOK(); ledGreen(1000);
+  if (autoLockEnabled) doorOpenedAt = millis();
+  lightOn = false;
   lcd.clear();
   lcd.setCursor(0,0); lcd.write(3); lcd.print(" ACCESS OK!    ");
   lcd.setCursor(0,1); lcd.print("   Door  OPEN   ");
@@ -481,10 +545,49 @@ void openDoor() {
 }
 
 // =========================================================
+// MỞ CỬA BẰNG VÂN TAY
+// =========================================================
+void openDoorWithName(int fingerId) {
+  isDoorOpen = true; myServo.write(90); beepOK(); ledGreen(1000);
+  if (autoLockEnabled) doorOpenedAt = millis();
+  lightOn = false;
+  String userName = loadFingerName(fingerId);
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.write(2); lcd.print(" ");
+  String nameTrunc = userName.length() > 13 ? userName.substring(0, 13) : userName;
+  lcd.print(nameTrunc);
+  lcd.setCursor(0,1); lcd.print("   Welcome! :)  ");
+  lcdUpdateTime = millis() + 3000;
+  matrixLastText = ""; matrixSetNormal();
+  Blynk.virtualWrite(V30, "Opened");
+  Serial.printf("[FINGER] Access OK - %s (ID:%d)\n", userName.c_str(), fingerId);
+}
+
+// =========================================================
 // SAI MẬT KHẨU
 // =========================================================
 void wrongPass() {
-  passFailCount++; beepFail(); ledRed(600);
+  passFailCount++;
+  keypadFailCount++;
+  beepFail(); ledRed(600);
+
+  // Keypad lockout check
+  if (keypadFailCount >= KEYPAD_MAX_FAIL) {
+    keypadLocked    = true;
+    keypadLockedAt  = millis();
+    keypadFailCount = 0;
+    inputPass       = "";
+    sysState        = STATE_NORMAL;
+    normalState     = true;
+    lcd.clear();
+    lcd.setCursor(0,0); lcd.print(" Keypad LOCKED! ");
+    lcd.setCursor(0,1); lcd.print("   Wait  30s    ");
+    lcdUpdateTime = millis() + 2000;
+    Serial.println("[KEYPAD] Locked 30s - too many fails");
+    return;
+  }
+
   if (passFailCount >= MAX_PASS_FAIL) {
     sysState = STATE_ALERT_PASS; alertStartTime = millis(); return;
   }
@@ -495,7 +598,7 @@ void wrongPass() {
 }
 
 // =========================================================
-// VÂN TAY — check 1 lần khi chạm, chờ nhấc tay mới check lại
+// VÂN TAY
 // =========================================================
 void getFingerprintID() {
   uint8_t p = finger.getImage();
@@ -527,10 +630,7 @@ void getFingerprintID() {
     p = finger.fingerFastSearch();
     if (p == FINGERPRINT_OK) {
       fingerFailCount = 0;
-      char idBuf[16]; sprintf(idBuf, " ID: %-10d", finger.fingerID);
-      lcd.clear(); lcd.setCursor(0,0); lcd.write(2); lcd.print(idBuf);
-      lcd.setCursor(0,1); lcd.print("  Access  OK!   ");
-      openDoor();
+      openDoorWithName(finger.fingerID);
     } else {
       fingerFailCount++; beepWarn();
       if (fingerFailCount >= MAX_FINGER_FAIL) {
@@ -552,9 +652,33 @@ void getFingerprintID() {
 }
 
 // =========================================================
+// ĐÈN TỰ ĐỘNG (PIR + tối)
+// =========================================================
+void handleAutoLight(int pirVal, int ldrVal) {
+  if (isDoorOpen) return;
+  if (pirVal == HIGH && ldrVal < LDR_DARK_THRESHOLD) {
+    if (pirAlertEnabled && !pirAlertActive && sysState == STATE_NORMAL) {
+      // ALERT MODE: báo động
+      pirAlertActive = true;
+      pirAlertStart  = millis();
+      sysState       = STATE_ALERT_PIR;
+      normalState    = false;
+      beepLen        = 0;
+      return;
+    }
+    if (!pirAlertEnabled && !lightOn) {
+      // NORMAL MODE: chỉ bật đèn
+      lightOn = true; lightOnAt = millis();
+      ledGreenOn(); Serial.println("[LIGHT] Auto light ON");
+    }
+  }
+  if (lightOn && millis() - lightOnAt >= LIGHT_DURATION) {
+    lightOn = false; ledAllOff(); Serial.println("[LIGHT] Auto light OFF");
+  }
+}
+
+// =========================================================
 // HIỂN THỊ BÌNH THƯỜNG
-// LCD xoay: TIME(8s) → DATE(4s) → WEATHER(4s)
-// Dùng biến global dispLastSec, dispT0 thay vì static local
 // =========================================================
 void handleNormalDisplay() {
   matrixSetNormal();
@@ -566,20 +690,15 @@ void handleNormalDisplay() {
       int ss = timeClient.getSeconds();
       char buf[17]; sprintf(buf, "   %02d:%02d:%02d   ", hh, mm, ss);
       lcd.setCursor(0,0); lcd.print("   -- TIME --   ");
-      if (ss != dispLastSec) {
-        dispLastSec = ss;
-        lcd.setCursor(0,1); lcd.print(buf);
-      }
+      if (ss != dispLastSec) { dispLastSec = ss; lcd.setCursor(0,1); lcd.print(buf); }
       if (!dispT0) dispT0 = millis();
-      if (millis() - dispT0 >= 8000) {
-        dispT0 = 0; dispLastSec = -1; displayMode = 1;
-      }
+      if (millis() - dispT0 >= 8000) { dispT0 = 0; dispLastSec = -1; displayMode = 1; }
       break;
     }
     case 1: {
       time_t e = timeClient.getEpochTime();
       struct tm* ti = gmtime(&e);
-      char buf[17]; sprintf(buf, "  %02d/%02d/%04d  ", ti->tm_mday, ti->tm_mon + 1, ti->tm_year + 1900);
+      char buf[17]; sprintf(buf, "  %02d/%02d/%04d  ", ti->tm_mday, ti->tm_mon+1, ti->tm_year+1900);
       lcd.setCursor(0,0); lcd.print("   -- DATE --   ");
       lcd.setCursor(0,1); lcd.print(buf);
       lcdUpdateTime = millis() + 4000; displayMode = 2;
@@ -606,7 +725,6 @@ void handleGasAlert(int gasVal) {
     lcd.clear();
     lcd.setCursor(0,0); lcd.write(0); lcd.print(" !!! Alert !!!!");
     lcd.setCursor(0,1); lcd.write(0); lcd.print(" GAS DETECTED!");
-    lcd.setCursor(15,1); lcd.print(" ");
     Blynk.logEvent("gas_alert", "GAS DETECTED! Value: " + String(gasVal));
   }
   if (millis() - lastBlink > 150) {
@@ -615,9 +733,8 @@ void handleGasAlert(int gasVal) {
     digitalWrite(BUZZER_PIN, blinkState ? HIGH : LOW);
   }
   if (millis() - alertStartTime >= ALERT_DURATION) {
-    if (analogRead(MQ2_PIN) > GAS_THRESHOLD) {
-      alertStartTime = millis();
-    } else {
+    if (analogRead(MQ2_PIN) > GAS_THRESHOLD) { alertStartTime = millis(); }
+    else {
       sysState = STATE_NORMAL; normalState = true;
       ledAllOff(); digitalWrite(BUZZER_PIN, LOW); beepLen = 0;
       matrixLastText = ""; lcd.clear(); displayMode = 0; lcdUpdateTime = 0;
@@ -626,36 +743,7 @@ void handleGasAlert(int gasVal) {
 }
 
 // =========================================================
-// BÁO ĐỘNG TRỘM (PIR)
-// =========================================================
-void handleAlertPIR() {
-  if (matrixLastText != "ALERT!!") {
-    matrixSetAlert();
-    lcd.clear();
-    lcd.setCursor(0,0); lcd.write(0); lcd.print(" !!! Alert !!!!");
-    lcd.setCursor(0,1); lcd.write(0); lcd.print("INTRUDER DETECT");
-    Blynk.logEvent("intruder_alert", "INTRUDER DETECTED!");
-  }
-  if (millis() - lastBlink > 200) {
-    lastBlink = millis(); blinkState = !blinkState;
-    if (blinkState) ledRedOn(); else ledAllOff();
-    digitalWrite(BUZZER_PIN, blinkState ? HIGH : LOW);
-  }
-  if (millis() - alertStartTime >= ALERT_DURATION) {
-    int pir = digitalRead(PIR_PIN);
-    int ldr = analogRead(LDR_PIN);
-    if (pir == HIGH && ldr < LDR_DARK_THRESHOLD) {
-      alertStartTime = millis();
-    } else {
-      sysState = STATE_NORMAL; normalState = true;
-      ledAllOff(); digitalWrite(BUZZER_PIN, LOW); beepLen = 0;
-      matrixLastText = ""; lcd.clear(); displayMode = 0; lcdUpdateTime = 0;
-    }
-  }
-}
-
-// =========================================================
-// BÁO ĐỘNG SAI PASS — không bị ảnh hưởng bởi alertEnabled
+// BÁO ĐỘNG SAI PASS
 // =========================================================
 void handleAlertPass() {
   if (matrixLastText != "ALERT!!") {
@@ -678,38 +766,53 @@ void handleAlertPass() {
 }
 
 // =========================================================
+// BÁO ĐỘNG PIR
+// =========================================================
+void handlePIRAlert() {
+  if (matrixLastText != "ALERT!!") {
+    matrixSetAlert();
+    lcd.clear();
+    lcd.setCursor(0,0); lcd.write(0); lcd.print(" !!! Alert !!!!");
+    lcd.setCursor(0,1); lcd.write(0); lcd.print(" INTRUDER DET! ");
+    Blynk.logEvent("pir_alert", "Motion detected in dark! Possible intruder!");
+  }
+  if (millis() - lastBlink > 150) {
+    lastBlink = millis(); blinkState = !blinkState;
+    if (blinkState) ledRedOn(); else ledAllOff();
+    digitalWrite(BUZZER_PIN, blinkState ? HIGH : LOW);
+  }
+  if (millis() - pirAlertStart >= ALERT_DURATION) {
+    sysState = STATE_NORMAL; normalState = true;
+    pirAlertActive = false;
+    ledAllOff(); digitalWrite(BUZZER_PIN, LOW); beepLen = 0;
+    matrixLastText = ""; lcd.clear(); displayMode = 0; lcdUpdateTime = 0;
+  }
+}
+
+// =========================================================
 // SETUP
 // =========================================================
 void setup() {
   Serial.begin(115200); delay(500);
-
   pinMode(MQ2_PIN, INPUT); pinMode(PIR_PIN, INPUT); pinMode(LDR_PIN, INPUT);
   pinMode(BUZZER_PIN, OUTPUT); pinMode(LED_RED, OUTPUT); pinMode(LED_GREEN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW); ledAllOff();
-
   myServo.attach(SERVO_PIN); myServo.write(0);
-
   Wire.begin(21, 22); lcd.init(); lcd.backlight();
   lcd.createChar(0, bellChar); lcd.createChar(1, lockChar);
   lcd.createChar(2, personChar); lcd.createChar(3, checkChar);
   lcd.clear(); lcd.setCursor(0,0); lcd.print("  Smart  Lock   ");
   lcd.setCursor(0,1); lcd.print("  Starting...   ");
-
   matrix.begin(); matrix.setIntensity(2); matrix.displayClear();
-  matrixShow("Smart Lock");
-  delay(1500);
-
+  matrixShow("Smart Lock"); delay(1500);
   mySerial.begin(57600, SERIAL_8N1, 16, 17); finger.begin(57600);
   if (!finger.verifyPassword()) {
     lcd.clear(); lcd.setCursor(0,0); lcd.print("  Finger sensor ");
     lcd.setCursor(0,1); lcd.print("  NOT  FOUND!   "); delay(2000);
   }
   keypad.setDebounceTime(50);
-
-  // Đọc password từ flash (persistent)
   prefs.begin("smartlock", false);
   password = prefs.getString("pass", "5678");
-
   lcd.clear(); lcd.setCursor(0,0); lcd.print(" Connecting...  ");
   lcd.setCursor(0,1); lcd.print(ssid);
   WiFi.begin(ssid, pass);
@@ -722,16 +825,14 @@ void setup() {
     lcd.clear(); lcd.setCursor(0,0); lcd.print("  WiFi  FAILED  ");
     lcd.setCursor(0,1); lcd.print("  Offline mode  "); delay(1500);
   }
-
   Blynk.config(auth); Blynk.connect();
   timeClient.begin(); timeClient.update();
-  timer.setInterval(1000L,    sendSensorData);
-  timer.setInterval(120000L,  getWeatherData);
+  timer.setInterval(1000L,   sendSensorData);
+  timer.setInterval(120000L, getWeatherData);
   getWeatherData();
-
   Blynk.virtualWrite(V30, "Closed");
   Blynk.virtualWrite(V40, 1);
-
+  Blynk.virtualWrite(V71, 1);
   lcd.clear(); lcd.setCursor(0,0); lcd.print("  System Ready  ");
   lcd.setCursor(0,1); lcd.print(" Press # to open");
   matrixLastText = ""; matrixSetNormal();
@@ -743,81 +844,156 @@ void setup() {
 // =========================================================
 void loop() {
   Blynk.run(); timer.run(); timeClient.update();
-  updateLED(); updateBuzzer();
 
-  // --- Enroll ---
+  if (!enrollingNow) { updateLED(); updateBuzzer(); }
+
+  // AUTO-LOCK CHECK
+  if (autoLockEnabled && isDoorOpen && doorOpenedAt > 0) {
+    if (millis() - doorOpenedAt >= autoLockDelay) { closeDoor(true); }
+  }
+
+  // ── ENROLL ──────────────────────────────────────────────
   if (isEnrolling) {
-    enrollFingerprint(idFromBlynk);  // LCD đã được restore bên trong hàm
-    isEnrolling = false;
-    Blynk.virtualWrite(V101, 0);     // đảm bảo button reset (phòng hờ)
-    blynkFlush();
+    enrollingNow = true;
+    digitalWrite(BUZZER_PIN, LOW);
+    beepLen = 0; beepIdx = 0; beepOn = false;
+    enrollFingerprint(idFromBlynk);
+    digitalWrite(BUZZER_PIN, LOW);
+    beepLen = 0; beepIdx = 0; beepOn = false;
+    enrollingNow = false;
+    isEnrolling = false; Blynk.virtualWrite(V101, 0); blynkFlush();
     normalState = true; sysState = STATE_NORMAL;
     displayMode = 0; lcdUpdateTime = millis() + 2000;
     dispT0 = 0; dispLastSec = -1;
-    Blynk.virtualWrite(V103, "SYSTEM NORMAL");
-    return;
+    Blynk.virtualWrite(V103, "SYSTEM NORMAL"); return;
   }
 
-  // --- Delete ---
+  // ── DELETE ──────────────────────────────────────────────
   if (isDeleting) {
     deleteFingerprint(idFromBlynk);
-    isDeleting = false;
-    Blynk.virtualWrite(V102, 0);     // đảm bảo button reset
-    blynkFlush();
+    isDeleting = false; Blynk.virtualWrite(V102, 0); blynkFlush();
     normalState = true; sysState = STATE_NORMAL;
     displayMode = 0; lcdUpdateTime = millis() + 2000;
-    Blynk.virtualWrite(V103, "SYSTEM NORMAL");
-    return;
+    Blynk.virtualWrite(V103, "SYSTEM NORMAL"); return;
   }
 
   int gasVal = analogRead(MQ2_PIN);
   int ldrVal = analogRead(LDR_PIN);
   int pirVal = digitalRead(PIR_PIN);
 
-  // Gas & PIR chỉ kích hoạt khi alertEnabled = true
+  // GAS ALERT
   if (gasVal > GAS_THRESHOLD && sysState != STATE_ALERT_GAS && alertEnabled) {
     sysState = STATE_ALERT_GAS; alertStartTime = millis(); normalState = false; beepLen = 0;
   }
   if (sysState == STATE_ALERT_GAS) { handleGasAlert(gasVal); return; }
 
-  if (pirVal == HIGH && ldrVal < LDR_DARK_THRESHOLD && sysState != STATE_ALERT_PIR && alertEnabled) {
-    sysState = STATE_ALERT_PIR; alertStartTime = millis(); normalState = false; beepLen = 0;
-  }
-  if (sysState == STATE_ALERT_PIR) { handleAlertPIR(); return; }
+  // PIR + TỐI → ĐÈN / BÁO ĐỘNG
+  handleAutoLight(pirVal, ldrVal);
 
-  // Sai pass vẫn báo động dù alertEnabled = false
+  if (sysState == STATE_ALERT_PIR)  { handlePIRAlert();  return; }
   if (sysState == STATE_ALERT_PASS) { handleAlertPass(); return; }
 
   if (sysState == STATE_NORMAL) getFingerprintID();
 
-  // --- KEYPAD ---
+  // =========================================================
+  // KEYPAD
+  // =========================================================
   char key = keypad.getKey();
-  if (key && millis() - lastKeyTime > 300) {
+
+  // KEYPAD LOCKOUT CHECK
+  if (keypadLocked) {
+    if (millis() - keypadLockedAt >= KEYPAD_LOCK_DURATION) {
+      keypadLocked = false; keypadFailCount = 0;
+      lcd.clear();
+      lcd.setCursor(0,0); lcd.print("  Keypad Ready  ");
+      lcd.setCursor(0,1); lcd.print("                ");
+      lcdUpdateTime = millis() + 1500;
+      Serial.println("[KEYPAD] Unlocked");
+    } else {
+      if (key) {
+        unsigned long remaining = (KEYPAD_LOCK_DURATION - (millis() - keypadLockedAt)) / 1000 + 1;
+        lcd.clear();
+        lcd.setCursor(0,0); lcd.print(" Keypad LOCKED! ");
+        char buf[17]; sprintf(buf, "  Wait:  %2lus     ", remaining);
+        lcd.setCursor(0,1); lcd.print(buf);
+        lcdUpdateTime = millis() + 1000;
+      }
+    }
+  }
+
+  if (!enrollingNow && !keypadLocked && key && millis() - lastKeyTime > 300) {
     lastKeyTime = millis(); beepKey();
 
-    if (key == 'D') {
-      // Reset toàn bộ hệ thống
+    // ─── A: RESET ────────────────────────────────────────
+    if (key == 'A') {
       sysState = STATE_NORMAL; normalState = true;
-      inputPass = ""; newPassBuf = "";
-      passFailCount = 0; fingerFailCount = 0;
+      inputPass = ""; newPassBuf = ""; enrollIDStr = "";
+      passFailCount = 0; fingerFailCount = 0; keypadFailCount = 0;
       isFingerLocked = false; isDoorOpen = false;
       fingerPresent = false; fingerProcessed = false;
-      myServo.write(0); ledAllOff(); digitalWrite(BUZZER_PIN, LOW); beepLen = 0;
+      doorOpenedAt = 0; lightOn = false;
+      pirAlertActive = false;
+      myServo.write(0); ledAllOff();
+      digitalWrite(BUZZER_PIN, LOW); beepLen = 0;
       matrixLastText = ""; matrixSetNormal();
       Blynk.virtualWrite(V30, "Closed");
-      lcd.clear(); lcd.setCursor(0,0); lcd.print("  System Reset  ");
+      lcd.clear();
+      lcd.setCursor(0,0); lcd.print("  System Reset  ");
       lcd.setCursor(0,1); lcd.print("   All  Clear   ");
       lcdUpdateTime = millis() + 1500;
       displayMode = 0; dispT0 = 0; dispLastSec = -1;
-      Serial.println("[RESET] System reset");
+      Serial.println("[RESET] System reset by key A");
     }
+
+    // ─── B: ĐỔI MẬT KHẨU ────────────────────────────────
     else if (key == 'B') {
-      sysState = STATE_CHANGE_PASS; normalState = false; cpStep = CP_OLD; inputPass = "";
-      lcd.clear(); lcd.setCursor(0,0); lcd.write(1); lcd.print(" Change  Pass  ");
-      lcd.setCursor(0,1); lcd.print("Old pass:       ");
+      if (sysState == STATE_NORMAL) {
+        sysState = STATE_CHANGE_PASS; normalState = false;
+        cpStep = CP_OLD; inputPass = "";
+        lcd.clear();
+        lcd.setCursor(0,0); lcd.write(1); lcd.print(" Change  Pass  ");
+        lcd.setCursor(0,1); lcd.print("Old pass:       ");
+      }
     }
-    else if (key == 'C' || key == '*') {
-      inputPass = "";
+
+    // ─── C: ENROLL VÂN TAY ───────────────────────────────
+    else if (key == 'C') {
+      if (sysState == STATE_NORMAL && !isEnrolling && !isDeleting) {
+        sysState = STATE_ENROLL_AUTH; normalState = false;
+        inputPass = "";
+        lcd.clear();
+        lcd.setCursor(0,0); lcd.write(1); lcd.print(" Enroll Finger ");
+        lcd.setCursor(0,1); lcd.print("Pass:           ");
+        Serial.println("[ENROLL-KEY] Enter auth password");
+      }
+    }
+
+    // ─── D: TOGGLE PIR ALERT ─────────────────────────────
+    else if (key == 'D') {
+      if (!pirAlertEnabled) {
+        // Bật: không cần pass
+        pirAlertEnabled = true;
+        lcd.clear();
+        lcd.setCursor(0,0); lcd.print(" PIR  Alert:    ");
+        lcd.setCursor(0,1); lcd.print("    ENABLED     ");
+        lcdUpdateTime = millis() + 2000;
+        beepWarn();
+        Serial.println("[PIR] Alert ENABLED via key D");
+      } else {
+        // Tắt: cần pass
+        sysState    = STATE_KEY_D_AUTH;
+        normalState = false;
+        inputPass   = "";
+        lcd.clear();
+        lcd.setCursor(0,0); lcd.write(1); lcd.print(" Disable Alert ");
+        lcd.setCursor(0,1); lcd.print("Pass:           ");
+        Serial.println("[PIR] Need pass to disable alert");
+      }
+    }
+
+    // ─── *: CLEAR ────────────────────────────────────────
+    else if (key == '*') {
+      inputPass = ""; enrollIDStr = "";
       if (sysState == STATE_ENTER_PASS) {
         lcd.setCursor(0,1); lcd.print("Pass:           ");
       } else if (sysState == STATE_CHANGE_PASS) {
@@ -825,54 +1001,129 @@ void loop() {
         if      (cpStep == CP_OLD)     lcd.print("Old pass:       ");
         else if (cpStep == CP_NEW)     lcd.print("New pass:       ");
         else if (cpStep == CP_CONFIRM) lcd.print("Confirm:        ");
-      } else {
-        sysState = STATE_ENTER_PASS; normalState = false;
-        lcd.clear(); lcd.setCursor(0,0); lcd.write(1); lcd.print(" Enter Password");
+      } else if (sysState == STATE_ENROLL_AUTH) {
+        lcd.setCursor(0,1); lcd.print("Pass:           ");
+      } else if (sysState == STATE_ENROLL_ID) {
+        lcd.setCursor(0,1); lcd.print("ID(1-127):      ");
+      } else if (sysState == STATE_KEY_D_AUTH) {
         lcd.setCursor(0,1); lcd.print("Pass:           ");
       }
     }
+
+    // ─── #: ENTER ────────────────────────────────────────
     else if (key == '#') {
-      if (sysState == STATE_NORMAL || sysState == STATE_ENTER_PASS) {
+
+      // STATE_KEY_D_AUTH: tắt PIR alert (cần pass)
+      if (sysState == STATE_KEY_D_AUTH) {
         if (inputPass == password) {
-          passFailCount = 0; isFingerLocked = false; openDoor();
+          pirAlertEnabled = false;
+          lcd.clear();
+          lcd.setCursor(0,0); lcd.print(" PIR  Alert:    ");
+          lcd.setCursor(0,1); lcd.print("    DISABLED    ");
+          beepOK(); ledGreen(1000);
+          Serial.println("[PIR] Alert DISABLED via key D");
+        } else {
+          lcd.clear();
+          lcd.setCursor(0,0); lcd.print(" Wrong password ");
+          lcd.setCursor(0,1); lcd.print(" Alert stays ON ");
+          beepFail(); ledRed(600);
+          Serial.println("[PIR] Wrong pass - alert stays ON");
+        }
+        inputPass = "";
+        sysState = STATE_NORMAL; normalState = true;
+        lcdUpdateTime = millis() + 2000;
+      }
+
+      else if (sysState == STATE_ENROLL_AUTH) {
+        if (inputPass == password) {
+          sysState = STATE_ENROLL_ID; enrollIDStr = ""; inputPass = "";
+          lcd.clear();
+          lcd.setCursor(0,0); lcd.print(" Enroll Finger  ");
+          lcd.setCursor(0,1); lcd.print("ID(1-127):      ");
+          Serial.println("[ENROLL-KEY] Auth OK, enter ID");
+        } else {
+          beepFail(); ledRed(600);
+          lcd.clear();
+          lcd.setCursor(0,0); lcd.print(" Wrong password ");
+          lcd.setCursor(0,1); lcd.print("  Try  again... ");
+          inputPass = "";
+          sysState = STATE_NORMAL; normalState = true;
+          lcdUpdateTime = millis() + 1500;
+          Serial.println("[ENROLL-KEY] Auth FAILED");
+        }
+      }
+
+      else if (sysState == STATE_ENROLL_ID) {
+        int enrollID = enrollIDStr.toInt();
+        if (enrollIDStr.length() == 0 || enrollID < 1 || enrollID > 127) {
+          beepFail(); ledRed(600);
+          lcd.clear();
+          lcd.setCursor(0,0); lcd.print("  Invalid  ID!  ");
+          lcd.setCursor(0,1); lcd.print(" Range: 1 - 127 ");
+          enrollIDStr = "";
+          delay(1500);
+          lcd.clear();
+          lcd.setCursor(0,0); lcd.print(" Enroll Finger  ");
+          lcd.setCursor(0,1); lcd.print("ID(1-127):      ");
+        } else {
+          pendingName = "";
+          idFromBlynk = enrollID;
+          isEnrolling = true; normalState = false;
+          sysState    = STATE_NORMAL;
+          lcd.clear();
+          lcd.setCursor(0,0); lcd.print("  Enrolling...  ");
+          char buf[17]; sprintf(buf, "   ID: %-3d      ", enrollID);
+          lcd.setCursor(0,1); lcd.print(buf);
+          enrollIDStr = "";
+          Serial.printf("[ENROLL-KEY] Starting enroll ID:%d\n", enrollID);
+        }
+      }
+
+      else if (sysState == STATE_NORMAL || sysState == STATE_ENTER_PASS) {
+        if (inputPass == password) {
+          passFailCount = 0; keypadFailCount = 0;
+          isFingerLocked = false; openDoor();
         } else {
           wrongPass();
         }
         inputPass = "";
         if (sysState != STATE_ALERT_PASS) { sysState = STATE_NORMAL; normalState = true; }
       }
+
       else if (sysState == STATE_CHANGE_PASS) {
         if (cpStep == CP_OLD) {
           if (inputPass == password) {
             cpStep = CP_NEW; inputPass = "";
-            lcd.clear(); lcd.setCursor(0,0); lcd.write(1); lcd.print(" Change  Pass  ");
+            lcd.clear();
+            lcd.setCursor(0,0); lcd.write(1); lcd.print(" Change  Pass  ");
             lcd.setCursor(0,1); lcd.print("New pass:       ");
           } else {
-            lcd.clear(); lcd.setCursor(0,0); lcd.print(" Wrong password ");
+            lcd.clear();
+            lcd.setCursor(0,0); lcd.print(" Wrong password ");
             lcd.setCursor(0,1); lcd.print("  Try  again... ");
             beepFail(); ledRed(600); inputPass = "";
             sysState = STATE_NORMAL; normalState = true;
             lcdUpdateTime = millis() + 1500;
           }
-        }
-        else if (cpStep == CP_NEW) {
+        } else if (cpStep == CP_NEW) {
           if (inputPass.length() > 0) {
             newPassBuf = inputPass; inputPass = ""; cpStep = CP_CONFIRM;
-            lcd.clear(); lcd.setCursor(0,0); lcd.write(1); lcd.print(" Change  Pass  ");
+            lcd.clear();
+            lcd.setCursor(0,0); lcd.write(1); lcd.print(" Change  Pass  ");
             lcd.setCursor(0,1); lcd.print("Confirm:        ");
           }
-        }
-        else if (cpStep == CP_CONFIRM) {
+        } else if (cpStep == CP_CONFIRM) {
           if (inputPass == newPassBuf) {
-            password = inputPass;
-            prefs.putString("pass", password);  // lưu xuống flash
+            password = inputPass; prefs.putString("pass", password);
             beepOK(); ledGreen(1500);
-            lcd.clear(); lcd.setCursor(0,0); lcd.write(3); lcd.print(" Pass changed! ");
+            lcd.clear();
+            lcd.setCursor(0,0); lcd.write(3); lcd.print(" Pass changed! ");
             lcd.setCursor(0,1); lcd.print("  New pass  OK  ");
             Serial.println("[PASS] New: " + password);
           } else {
             beepFail(); ledRed(600);
-            lcd.clear(); lcd.setCursor(0,0); lcd.print("  Not  matched! ");
+            lcd.clear();
+            lcd.setCursor(0,0); lcd.print("  Not  matched! ");
             lcd.setCursor(0,1); lcd.print("  Try  again... ");
           }
           inputPass = ""; newPassBuf = "";
@@ -881,33 +1132,51 @@ void loop() {
         }
       }
     }
-    else if (key != 'A' && key != 'D') {
-      if (sysState == STATE_NORMAL) {
-        sysState = STATE_ENTER_PASS; normalState = false; inputPass = "";
-        lcd.clear(); lcd.setCursor(0,0); lcd.write(1); lcd.print(" Enter Password");
-        lcd.setCursor(0,1); lcd.print("Pass:           ");
-      }
-      if (sysState == STATE_ENTER_PASS || sysState == STATE_CHANGE_PASS) {
-        inputPass += key;
-        String stars = "";
-        for (size_t i = 0; i < inputPass.length(); i++) stars += "*";
-        String disp = stars.length() > 9 ? stars.substring(stars.length() - 9) : stars;
-        lcd.setCursor(0,0);
-        if (sysState == STATE_ENTER_PASS) {
-          lcd.write(1); lcd.print(" Enter Password");
-        } else {
-          lcd.write(1);
-          if      (cpStep == CP_OLD)     lcd.print(" Change  Pass  ");
-          else if (cpStep == CP_NEW)     lcd.print(" New  Password ");
-          else if (cpStep == CP_CONFIRM) lcd.print(" Confirm  Pass ");
+
+    // ─── 0-9: NHẬP SỐ ────────────────────────────────────
+    else if (key >= '0' && key <= '9') {
+      if (sysState == STATE_ENROLL_ID) {
+        if (enrollIDStr.length() < 3) {
+          enrollIDStr += key;
+          lcd.setCursor(0,0); lcd.print(" Enroll Finger  ");
+          lcd.setCursor(0,1);
+          lcd.print("ID: ");
+          lcd.print(enrollIDStr);
+          for (int i = enrollIDStr.length(); i < 12; i++) lcd.print(" ");
         }
-        lcd.setCursor(0,1);
-        if      (sysState == STATE_ENTER_PASS)                        lcd.print("Pass: ");
-        else if (sysState == STATE_CHANGE_PASS && cpStep == CP_OLD)   lcd.print("Old:  ");
-        else if (sysState == STATE_CHANGE_PASS && cpStep == CP_NEW)   lcd.print("New:  ");
-        else if (sysState == STATE_CHANGE_PASS && cpStep == CP_CONFIRM) lcd.print("Cnf:  ");
-        lcd.print(disp);
-        for (int i = disp.length(); i < 10; i++) lcd.print(" ");
+      } else {
+        if (sysState == STATE_NORMAL) {
+          sysState = STATE_ENTER_PASS; normalState = false; inputPass = "";
+          lcd.clear();
+          lcd.setCursor(0,0); lcd.write(1); lcd.print(" Enter Password");
+          lcd.setCursor(0,1); lcd.print("Pass:           ");
+        }
+        if (sysState == STATE_ENTER_PASS || sysState == STATE_CHANGE_PASS
+            || sysState == STATE_ENROLL_AUTH || sysState == STATE_KEY_D_AUTH) {
+          inputPass += key;
+          String stars = "";
+          for (size_t i = 0; i < inputPass.length(); i++) stars += "*";
+          String disp = stars.length() > 9 ? stars.substring(stars.length()-9) : stars;
+          lcd.setCursor(0,0);
+          if      (sysState == STATE_ENTER_PASS)   { lcd.write(1); lcd.print(" Enter Password"); }
+          else if (sysState == STATE_ENROLL_AUTH)  { lcd.write(1); lcd.print(" Enroll Finger "); }
+          else if (sysState == STATE_KEY_D_AUTH)   { lcd.write(1); lcd.print(" Disable Alert "); }
+          else {
+            lcd.write(1);
+            if      (cpStep == CP_OLD)     lcd.print(" Change  Pass  ");
+            else if (cpStep == CP_NEW)     lcd.print(" New  Password ");
+            else if (cpStep == CP_CONFIRM) lcd.print(" Confirm  Pass ");
+          }
+          lcd.setCursor(0,1);
+          if      (sysState == STATE_ENTER_PASS)                          lcd.print("Pass: ");
+          else if (sysState == STATE_ENROLL_AUTH)                         lcd.print("Pass: ");
+          else if (sysState == STATE_KEY_D_AUTH)                          lcd.print("Pass: ");
+          else if (sysState == STATE_CHANGE_PASS && cpStep == CP_OLD)     lcd.print("Old:  ");
+          else if (sysState == STATE_CHANGE_PASS && cpStep == CP_NEW)     lcd.print("New:  ");
+          else if (sysState == STATE_CHANGE_PASS && cpStep == CP_CONFIRM) lcd.print("Cnf:  ");
+          lcd.print(disp);
+          for (int i = disp.length(); i < 10; i++) lcd.print(" ");
+        }
       }
     }
   }
@@ -916,10 +1185,13 @@ void loop() {
 
   if (millis() - lastConsoleTime > 1000) {
     lastConsoleTime = millis();
-    Serial.printf("[GAS]%d [LDR]%d [PIR]%d [LOCKED]%s [DOOR]%s [ALERT]%s\n",
+    Serial.printf("[GAS]%d [LDR]%d [PIR]%d [LIGHT]%s [DOOR]%s [AUTO-LOCK]%s(%lus) [PIR-ALERT]%s [KP-LOCK]%s\n",
       gasVal, ldrVal, pirVal,
-      isFingerLocked ? "YES" : "NO",
-      isDoorOpen     ? "OPEN" : "CLOSED",
-      alertEnabled   ? "ON" : "OFF");
+      lightOn          ? "ON"   : "OFF",
+      isDoorOpen       ? "OPEN" : "CLOSED",
+      autoLockEnabled  ? "ON"   : "OFF",
+      autoLockDelay / 1000,
+      pirAlertEnabled  ? "ON"   : "OFF",
+      keypadLocked     ? "LOCKED" : "OK");
   }
 }
